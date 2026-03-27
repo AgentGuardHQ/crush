@@ -202,4 +202,3 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-require github.com/AgentGuardHQ/agentguard/go v0.1.0

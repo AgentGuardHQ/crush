@@ -5,98 +5,82 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-
-	"github.com/AgentGuardHQ/agentguard/go/pkg/hook"
+	"os/exec"
+	"strings"
 )
 
-// agentGuardHandler is lazily initialized on first governance check.
-var agentGuardHandler *hook.Handler
-
-// evaluateWithAgentGuard checks if an action is allowed by the AgentGuard
-// governance kernel. Uses the Go kernel directly as a library — no subprocess,
-// no CLI dependency, in-process policy evaluation.
+// evaluateWithAgentGuard checks if an action is allowed by ShellForge's
+// governance engine. Calls `shellforge evaluate` as a subprocess.
 //
-// Activated by SHELLFORGE_GOVERNANCE=true. Every tool call is evaluated against
-// agentguard.yaml before Crush's own permission system runs.
+// Activated by SHELLFORGE_GOVERNANCE=true. Every tool call is evaluated
+// against agentguard.yaml before Crush's own permission system runs.
 //
-// If governance is disabled or no policy file is found, returns (true, "")
+// If governance is disabled or shellforge isn't installed, returns (true, "")
 // to fall through to Crush's normal permissions.
 func evaluateWithAgentGuard(opts CreatePermissionRequest) (bool, string) {
 	if os.Getenv("SHELLFORGE_GOVERNANCE") != "true" {
 		return true, ""
 	}
 
-	// Lazy-init the handler on first call
-	if agentGuardHandler == nil {
-		policyPath := findPolicyFile()
-		if policyPath == "" {
-			slog.Debug("no agentguard.yaml found, skipping governance")
-			return true, ""
-		}
-		h, err := hook.NewHandler([]string{policyPath})
-		if err != nil {
-			slog.Warn("agentguard policy load failed", "error", err)
-			return true, "" // fail-open
-		}
-		agentGuardHandler = h
-		slog.Info("agentguard governance loaded", "policy", policyPath)
+	sfBin, err := exec.LookPath("shellforge")
+	if err != nil {
+		slog.Debug("shellforge not found, skipping governance")
+		return true, ""
 	}
 
-	// Build hook input matching AgentGuard's expected format
-	inputFields := map[string]any{
-		"command": opts.Action,
+	// Check for policy file
+	policyFound := false
+	for _, path := range []string{"agentguard.yaml", "../agentguard.yaml"} {
+		if _, err := os.Stat(path); err == nil {
+			policyFound = true
+			break
+		}
 	}
-	if opts.Path != "" {
-		inputFields["file_path"] = opts.Path
+	if !policyFound {
+		slog.Debug("no agentguard.yaml found, skipping governance")
+		return true, ""
+	}
+
+	// Build evaluation payload
+	payload := map[string]any{
+		"tool":   opts.ToolName,
+		"action": opts.Action,
+		"path":   opts.Path,
 	}
 	if opts.Params != nil {
-		if m, ok := opts.Params.(map[string]any); ok {
-			for k, v := range m {
-				inputFields[k] = v
-			}
-		}
+		payload["params"] = opts.Params
 	}
-	inputJSON, _ := json.Marshal(inputFields)
+	payloadJSON, _ := json.Marshal(payload)
 
-	input := hook.HookInput{
-		Tool:  opts.ToolName,
-		Input: json.RawMessage(inputJSON),
-		Event: hook.PreToolUse,
+	// Call shellforge evaluate
+	cmd := exec.Command(sfBin, "evaluate")
+	cmd.Stdin = strings.NewReader(string(payloadJSON))
+	out, err := cmd.Output()
+	if err != nil {
+		// Fail-open on error
+		slog.Warn("shellforge evaluate failed", "error", err)
+		return true, ""
 	}
 
-	// Evaluate against AgentGuard policies
-	resp := agentGuardHandler.Handle(input)
+	var result struct {
+		Allowed    bool   `json:"allowed"`
+		Reason     string `json:"reason"`
+		Suggestion string `json:"suggestion"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		slog.Warn("shellforge response parse failed", "error", err)
+		return true, ""
+	}
 
-	if resp.Decision != "allow" {
-		reason := resp.Reason
-		if resp.Suggestion != "" {
-			reason = fmt.Sprintf("%s (suggestion: %s)", reason, resp.Suggestion)
+	if !result.Allowed {
+		reason := result.Reason
+		if result.Suggestion != "" {
+			reason = fmt.Sprintf("%s (suggestion: %s)", reason, result.Suggestion)
 		}
-		slog.Info("agentguard denied",
-			"tool", opts.ToolName,
-			"action", opts.Action,
-			"reason", reason,
-		)
+		slog.Info("agentguard denied", "tool", opts.ToolName, "reason", reason)
 		return false, reason
 	}
 
 	slog.Debug("agentguard allowed", "tool", opts.ToolName)
 	return true, ""
-}
-
-// findPolicyFile looks for agentguard.yaml in standard locations.
-func findPolicyFile() string {
-	for _, path := range []string{
-		"agentguard.yaml",
-		"../agentguard.yaml",
-		os.Getenv("AGENTGUARD_POLICY"),
-	} {
-		if path == "" {
-			continue
-		}
-		if _, err := os.Stat(path); err == nil {
-			return path
-		}
-	}
-	return ""
 }
