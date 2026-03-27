@@ -3,6 +3,7 @@ package permission
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -130,6 +131,12 @@ func (s *permissionService) Deny(permission PermissionRequest) {
 }
 
 func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRequest) (bool, error) {
+	// AgentGuard governance check — runs before Crush's own permissions.
+	// Active when SHELLFORGE_GOVERNANCE=true and agentguard.yaml exists.
+	if allowed, reason := evaluateWithAgentGuard(opts); !allowed {
+		return false, fmt.Errorf("governance denied: %s", reason)
+	}
+
 	if s.skip {
 		return true, nil
 	}
